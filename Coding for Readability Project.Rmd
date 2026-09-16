@@ -1,0 +1,508 @@
+---
+title: "CLEAR Feb 12"
+author: "York Wang"
+date: "2026-02-12"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{python}
+import pandas as pd
+import numpy as np
+
+from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+from sklearn.preprocessing import StandardScaler
+
+import matplotlib.pyplot as plt
+```
+
+```{python}
+import os
+os.getcwd()
+```
+
+```{python}
+import pandas as pd
+df = pd.read_excel(
+    "/Users/wangenyou/Desktop/LA Final B/CLEAR and RACE Datasets/CLEAR0130.xlsx"
+)
+```
+
+```{python}
+df.head()
+df.columns
+```
+
+```{python}
+texts = df["Excerpt"].dropna().astype(str).tolist()
+```
+
+```{python}
+#Tokenization
+import nltk
+from nltk.tokenize import word_tokenize
+
+nltk.download("punkt")
+
+tokenized_texts = [
+    word_tokenize(t.lower())
+    for t in texts
+]
+```
+
+```{python}
+from gensim.models import FastText
+
+ft = FastText(
+    sentences=tokenized_texts,
+    vector_size=100,
+    window=5,
+    min_count=5,
+    workers=4,
+    seed=42
+)
+```
+
+```{python}
+import numpy as np
+
+vocab = list(ft.wv.index_to_key)
+X_vocab = np.array([ft.wv[w] for w in vocab])
+
+X_vocab.shape
+```
+
+```{python}
+import pandas as pd
+
+df_emb = pd.DataFrame(
+    X_vocab,
+    columns=[f"emb_{i+1}" for i in range(X_vocab.shape[1])]
+)
+
+df_emb.insert(0, "word", vocab)
+
+df_emb.to_excel("fasttext_vocab_embeddings.xlsx", index=False)
+```
+
+```{python}
+import pandas as pd
+
+df_emb = pd.read_excel("fasttext_vocab_embeddings.xlsx")
+```
+
+```{python}
+from sklearn.preprocessing import StandardScaler
+
+embedding_cols = [c for c in df_emb.columns if c.startswith("emb_")]
+X = df_emb[embedding_cols].values
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+```
+
+```{python}
+from sklearn.cluster import KMeans
+
+K = 20   # Starting with 20 
+
+kmeans = KMeans(
+    n_clusters=K,
+    random_state=42,
+    n_init=20
+)
+
+df_emb["kmeans_cluster"] = kmeans.fit_predict(X_scaled)
+```
+
+```{python}
+df_emb.to_excel("fasttext_vocab_with_kmeans.xlsx", index=False)
+```
+
+```{python}
+df_emb["kmeans_cluster"].value_counts().sort_index()
+```
+
+```{python}
+for k in sorted(df_emb["kmeans_cluster"].unique()):
+    words = df_emb.loc[df_emb["kmeans_cluster"] == k, "word"]
+    print(f"\n=== Cluster {k} (n={len(words)}) ===")
+    print(", ".join(words.head(30)))
+```
+
+```{python}
+import pandas as pd
+import numpy as np
+
+df_emb = pd.read_excel("fasttext_vocab_with_kmeans.xlsx")
+
+embedding_cols = [c for c in df_emb.columns if c.startswith("emb_")]
+X = df_emb[embedding_cols].values
+labels = df_emb["kmeans_cluster"].values
+```
+
+```{python}
+import pandas as pd
+import numpy as np
+import nltk
+from nltk.tokenize import word_tokenize
+
+# 1️⃣ 讀 kmeans vocab
+df_kmeans = pd.read_excel("fasttext_vocab_with_kmeans.xlsx")
+df_kmeans["word"] = df_kmeans["word"].str.lower()
+
+# 2️⃣ 建 word → cluster
+word2cluster = dict(
+    zip(df_kmeans["word"], df_kmeans["kmeans_cluster"])
+)
+
+# 3️⃣ cluster 數
+K = df_kmeans["kmeans_cluster"].nunique()
+
+# 4️⃣ tokenize 文件（一定要先有 df）
+nltk.download("punkt")
+
+doc_tokens = [
+    word_tokenize(str(t).lower())
+    for t in df["Excerpt"]
+]
+```
+
+```{python}
+word2cluster = dict(
+    zip(df_kmeans["word"], df_kmeans["kmeans_cluster"]))
+    
+X_doc = []
+
+for tokens in doc_tokens:
+    vec = np.zeros(K)
+    count = 0
+
+    for w in tokens:
+        if w in word2cluster:
+            vec[word2cluster[w]] += 1
+            count += 1
+
+    if count > 0:
+        vec = vec / count
+
+    X_doc.append(vec)
+
+X_doc = np.array(X_doc)
+```
+
+```{python}
+X_doc.shape
+```
+
+```{python}
+y = df["BT Easiness"].values
+```
+
+```{python}
+from sklearn.svm import SVR
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_validate, KFold
+import numpy as np
+import pandas as pd
+
+# ===============================
+# Prepare features
+# ===============================
+
+reading_cols = [
+    "Flesch-Reading-Ease",
+    "New Dale-Chall Readability Formula"
+]
+
+X_reading = df[reading_cols].values
+X_both = np.hstack([X_cluster, X_reading])
+
+# ===============================
+# Function
+# ===============================
+
+def run_linear_svr_cv(X, y, label):
+
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("svr", SVR(kernel="linear", C=1))
+    ])
+
+    cv = KFold(n_splits=10, shuffle=True, random_state=42)
+
+    cv_results = cross_validate(
+        pipe,
+        X,
+        y,
+        cv=cv,
+        scoring={
+            "rmse": "neg_root_mean_squared_error",
+            "mae": "neg_mean_absolute_error",
+            "r2": "r2"
+        }
+    )
+
+    rmse = -cv_results["test_rmse"].mean()
+    mae = -cv_results["test_mae"].mean()
+    r2 = cv_results["test_r2"].mean()
+
+    print(f"\nLinear SVR results ({label})")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"MAE : {mae:.4f}")
+    print(f"R2  : {r2:.4f}")
+
+    return {
+        "Model": label,
+        "RMSE": rmse,
+        "MAE": mae,
+        "R2": r2
+    }
+
+# ===============================
+# Run models
+# ===============================
+
+results = []
+
+results.append(run_linear_svr_cv(X_cluster, y, "Kmeans only"))
+results.append(run_linear_svr_cv(X_reading, y, "Reading indices only"))
+results.append(run_linear_svr_cv(X_both, y, "Kmeans + Reading indices"))
+```
+
+```{python}
+from sklearn.svm import SVR
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import cross_validate, KFold
+import numpy as np
+import pandas as pd
+
+# ===============================
+# Prepare features
+# ===============================
+
+reading_cols = [
+    "Flesch-Reading-Ease",
+    "New Dale-Chall Readability Formula"
+]
+
+X_reading = df[reading_cols].values
+X_both = np.hstack([X_cluster, X_reading])
+
+# ===============================
+# Function
+# ===============================
+
+def run_rbf_svr_cv(X, y, label):
+
+    pipe = Pipeline([
+        ("scaler", StandardScaler()),
+        ("svr", SVR(kernel="rbf", C=1))
+    ])
+
+    cv = KFold(n_splits=10, shuffle=True, random_state=42)
+
+    cv_results = cross_validate(
+        pipe,
+        X,
+        y,
+        cv=cv,
+        scoring={
+            "rmse": "neg_root_mean_squared_error",
+            "mae": "neg_mean_absolute_error",
+            "r2": "r2"
+        }
+    )
+
+    rmse = -cv_results["test_rmse"].mean()
+    mae = -cv_results["test_mae"].mean()
+    r2 = cv_results["test_r2"].mean()
+
+    print(f"\nrbf SVR results ({label})")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"MAE : {mae:.4f}")
+    print(f"R2  : {r2:.4f}")
+
+    return {
+        "Model": label,
+        "RMSE": rmse,
+        "MAE": mae,
+        "R2": r2
+    }
+
+# ===============================
+# Run models
+# ===============================
+
+results = []
+
+results.append(run_rbf_svr_cv(X_cluster, y, "Kmeans only"))
+results.append(run_rbf_svr_cv(X_reading, y, "Reading indices only"))
+results.append(run_rbf_svr_cv(X_both, y, "Kmeans + Reading indices"))
+```
+
+```{python}
+import shap
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.svm import SVR
+from sklearn.preprocessing import StandardScaler
+
+# -----------------------------
+# Feature names: 20 clusters + 2 readability indices
+# -----------------------------
+
+cluster_names = [f"Cluster {i+1}" for i in range(20)]
+
+reading_names = [
+    "Flesch Reading Ease",
+    "New Dale-Chall"
+]
+
+feature_names = cluster_names + reading_names
+
+# Check that we really have 22 features
+print("Number of features:", len(feature_names))
+print("Shape of X_both:", X_both.shape)
+
+# -----------------------------
+# Standardize features
+# -----------------------------
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X_both)
+
+# -----------------------------
+# Train final linear SVR
+# -----------------------------
+
+model = SVR(kernel="linear", C=1)
+model.fit(X_scaled, y)
+
+# -----------------------------
+# Calculate SHAP values
+# -----------------------------
+
+explainer = shap.Explainer(model.predict, X_scaled)
+shap_values = explainer(X_scaled)
+
+# -----------------------------
+# Plot all 22 features
+# -----------------------------
+
+plt.figure(figsize=(9, 10))
+
+shap.summary_plot(
+    shap_values,
+    X_scaled,
+    feature_names=feature_names,
+    max_display=22,
+    show=False
+)
+
+plt.xlabel(
+    "SHAP value (impact on predicted BT Easiness)",
+    fontsize=11
+)
+
+plt.xticks(fontsize=9)
+plt.yticks(fontsize=9)
+
+plt.tight_layout()
+
+plt.savefig(
+    "SHAP_summary_22_features.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+```
+
+```{python}
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import numpy as np
+
+# 1. Get the 100 FastText embedding columns
+embedding_cols = [
+    c for c in df_emb.columns
+    if c.startswith("emb_")
+]
+
+print("Number of embedding dimensions:", len(embedding_cols))
+
+# 2. Extract embeddings and cluster labels
+X_embedding = df_emb[embedding_cols].to_numpy(dtype=float)
+cluster_labels = df_emb["kmeans_cluster"].to_numpy()
+
+print("Embedding shape:", X_embedding.shape)
+print("Number of words:", len(cluster_labels))
+print("Clusters:", np.unique(cluster_labels))
+
+# 3. Reduce 100 dimensions to 3 dimensions using PCA
+pca = PCA(n_components=3)
+X_pca = pca.fit_transform(X_embedding)
+
+print(
+    "Variance explained by 3 PCs:",
+    pca.explained_variance_ratio_.sum()
+)
+
+# ˋ4. Visualization
+# Set cropping range
+lower = 3
+upper = 97
+
+x_low, x_high = np.percentile(X_pca[:, 0], [lower, upper])
+y_low, y_high = np.percentile(X_pca[:, 1], [lower, upper])
+z_low, z_high = np.percentile(X_pca[:, 2], [lower, upper])
+
+# Keep only points inside the displayed cube
+mask = (
+    (X_pca[:, 0] >= x_low) & (X_pca[:, 0] <= x_high) &
+    (X_pca[:, 1] >= y_low) & (X_pca[:, 1] <= y_high) &
+    (X_pca[:, 2] >= z_low) & (X_pca[:, 2] <= z_high)
+)
+
+# Create figure
+fig = plt.figure(figsize=(10, 8))
+ax = fig.add_subplot(111, projection="3d")
+
+# Plot only points inside the cube
+scatter = ax.scatter(
+    X_pca[mask, 0],
+    X_pca[mask, 1],
+    X_pca[mask, 2],
+    c=cluster_labels[mask],
+    cmap="tab20",
+    s=12,
+    alpha=0.6
+)
+
+# Set cube boundaries
+ax.set_xlim(x_low, x_high)
+ax.set_ylim(y_low, y_high)
+ax.set_zlim(z_low, z_high)
+
+ax.set_xlabel("PC1")
+ax.set_ylabel("PC2")
+ax.set_zlabel("PC3")
+
+ax.set_title(
+    "PCA Visualization of FastText Embeddings and K-means Clusters",
+     pad=-3
+)
+# Leave some white space above the title
+plt.subplots_adjust(top=0.930)
+
+plt.show()
+```
+
